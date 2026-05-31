@@ -1,1 +1,267 @@
-# Напишите здесь CI/CD пайплайн согласно заданию
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия образа для production (тег)'
+        required: false
+        default: 'latest'
+
+jobs:
+  # CI: сборка, тестирование и статический анализ
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang-tidy ccache curl
+          # Установка wrk для нагрузочного тестирования
+          sudo apt-get install -y build-essential libssl-dev git
+          git clone https://github.com/wg/wrk.git
+          cd wrk && make && sudo cp wrk /usr/local/bin/
+      
+      - name: Cache ccache
+        uses: actions/cache@v3
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+          restore-keys: ccache-${{ runner.os }}-
+      
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra"
+      
+      - name: Build application
+        run: cmake --build build
+      
+      - name: Run unit tests
+        run: |
+          cd build && ctest --output-on-failure
+      
+      - name: Run integration tests
+        run: |
+          # Запускаем приложение в фоне
+          ./build/app &
+          APP_PID=$!
+          # Ждем запуска сервера
+          sleep 3
+          # Проверяем health endpoint
+          curl --retry 5 --retry-delay 1 --fail http://localhost:8080/health || exit 1
+          # Запускаем интеграционные тесты
+          chmod +x tests/integration_test.sh
+          bash tests/integration_test.sh
+          # Останавливаем приложение
+          kill $APP_PID
+      
+      - name: Run load test (wrk)
+        run: |
+          # Запускаем приложение в фоне
+          ./build/app &
+          APP_PID=$!
+          sleep 3
+          # Запускаем нагрузочный тест: 2 потока, 100 соединений, 10 секунд
+          wrk -t2 -c100 -d10s http://localhost:8080/ || true
+          # Останавливаем приложение
+          kill $APP_PID
+      
+      - name: Static analysis (clang-tidy)
+        run: |
+          clang-tidy src/main.cpp -- -I.
+
+  # Сборка и публикация Docker-образа
+  docker-build-push:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      
+      - name: Convert repository name to lowercase
+        run: |
+          echo "REPO_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+      
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=ghcr.io/${{ env.REPO_LOWER }}:latest
+          docker build -f Dockerfile.txt -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+      
+      - name: Build and push with commit SHA tag
+        run: |
+          IMAGE_TAG_SHA=ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
+          docker build -f Dockerfile.txt -t $IMAGE_TAG_SHA .
+          docker push $IMAGE_TAG_SHA
+
+  # Деплой в staging (автоматический)
+  deploy-staging:
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Convert repository name to lowercase
+        run: |
+          echo "REPO_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+      
+      - name: Deploy to staging
+        run: |
+          # Загружаем образ
+          docker pull ghcr.io/${{ env.REPO_LOWER }}:latest
+          # Останавливаем и удаляем старый контейнер, если есть
+          docker stop staging-app 2>/dev/null || true
+          docker rm staging-app 2>/dev/null || true
+          # Запускаем новый контейнер
+          docker run -d --name staging-app -p 8080:8080 ghcr.io/${{ env.REPO_LOWER }}:latest
+          sleep 5
+          # Health check
+          curl --retry 5 --retry-delay 2 --fail http://localhost:8080/health || exit 1
+          echo "Staging deployment successful" >> deployment.log
+      
+      - name: Save staging logs
+        if: always()
+        run: docker logs staging-app > staging_logs.txt 2>&1
+      
+      - name: Upload staging logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-logs
+          path: staging_logs.txt
+      
+      - name: Save staging metrics
+        run: |
+          curl -s http://localhost:8080/metrics > staging_metrics.txt
+      
+      - name: Upload staging metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-metrics
+          path: staging_metrics.txt
+
+  # Деплой в production (ручной, blue-green)
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch'
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Convert repository name to lowercase
+        run: |
+          echo "REPO_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+      
+      - name: Blue-green deploy to production
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then VERSION="latest"; fi
+          IMAGE="ghcr.io/${{ env.REPO_LOWER }}:$VERSION"
+          
+          echo "Deploying version: $VERSION"
+          echo "Image: $IMAGE"
+          
+          # Загружаем образ
+          docker pull $IMAGE
+          
+          # Запускаем новую версию (green) на порту 8081
+          docker stop app-green 2>/dev/null || true
+          docker rm app-green 2>/dev/null || true
+          docker run -d --name app-green -p 8081:8080 $IMAGE
+          sleep 5
+          
+          # Проверяем health новой версии
+          curl --retry 5 --retry-delay 2 --fail http://localhost:8081/health || exit 1
+          
+          # Останавливаем старый blue (текущую production версию)
+          docker stop app-blue 2>/dev/null || true
+          
+          # Запускаем новую версию на основном порту 8080
+          docker run -d --name app-blue -p 8080:8080 $IMAGE
+          sleep 3
+          
+          # Проверяем health на основном порту
+          curl --fail http://localhost:8080/health || exit 1
+          
+          # Удаляем green (вспомогательный контейнер)
+          docker stop app-green && docker rm app-green
+          
+          # Сохраняем текущую версию
+          echo $VERSION > current_version.txt
+          echo "Production deployment successful for version $VERSION"
+      
+      - name: Save production logs
+        if: always()
+        run: docker logs app-blue > production_logs.txt 2>&1
+      
+      - name: Upload production logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-logs
+          path: production_logs.txt
+      
+      - name: Save production metrics
+        run: |
+          curl -s http://localhost:8080/metrics > production_metrics.txt
+      
+      - name: Upload production metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-metrics
+          path: production_metrics.txt
+
+  # Уведомления (отчёт-артефакт)
+  notification:
+    if: always()
+    needs: [build-and-test, docker-build-push, deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate notification report
+        run: |
+          echo "==== CI/CD Pipeline Notification Report ====" > report.txt
+          echo "" >> report.txt
+          echo "Repository: ${{ github.repository }}" >> report.txt
+          echo "Run number: ${{ github.run_number }}" >> report.txt
+          echo "Run ID: ${{ github.run_id }}" >> report.txt
+          echo "Triggered by: ${{ github.actor }}" >> report.txt
+          echo "Event type: ${{ github.event_name }}" >> report.txt
+          echo "Branch: ${{ github.ref_name }}" >> report.txt
+          echo "Commit SHA: ${{ github.sha }}" >> report.txt
+          echo "Date: $(date)" >> report.txt
+          echo "" >> report.txt
+          echo "Job Statuses:" >> report.txt
+          echo "- build-and-test: ${{ needs.build-and-test.result }}" >> report.txt
+          echo "- docker-build-push: ${{ needs.docker-build-push.result }}" >> report.txt
+          echo "- deploy-staging: ${{ needs.deploy-staging.result }}" >> report.txt
+          echo "- deploy-production: ${{ needs.deploy-production.result }}" >> report.txt
+          echo "" >> report.txt
+          echo "Overall status: ${{ job.status }}" >> report.txt
+      
+      - name: Upload notification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: notification-report-${{ github.run_id }}
+          path: report.txt
